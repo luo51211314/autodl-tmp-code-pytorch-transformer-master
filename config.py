@@ -1,10 +1,9 @@
 from pathlib import Path
 
-
 def get_config():
     return {
         "batch_size": 32,
-        "num_epochs": 40,
+        "num_epochs": 50,
         "lr": 1e-4,
         "seq_len": 512,
         "d_model": 512,
@@ -12,9 +11,10 @@ def get_config():
         "lang_tgt": "it",
         "model_folder": "weights",
         "model_basename": "tmodel_",
-        "preload": 39,
+        "preload": None,
         "tokenizer_file": "tokenizer_{0}.json",
-        "experiment_name": "runs/tmodel"
+        "experiment_name": "runs/tmodel",
+        "log_file": "training_log.txt"
     }
 
 

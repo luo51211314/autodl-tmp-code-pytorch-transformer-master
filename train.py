@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
+import time
+import psutil
+import torch.cuda as cuda
 
 from dataset import BilingualDataset, causal_mask
 from model import build_transformer
-
 from config import get_config, get_weights_file_path
 
 from datasets import load_dataset, load_from_disk
@@ -14,10 +16,39 @@ from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
 from torch.utils.tensorboard import SummaryWriter
+from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+import nltk
 
 import warnings
 from tqdm import tqdm
 from pathlib import Path
+
+# nltk.download('punkt', quiet=True)
+warnings.filterwarnings("ignore")
+
+
+def log_metrics(epoch, train_loss, val_loss, bleu_score, log_file):
+    # Get memory usage
+    cpu_mem = psutil.virtual_memory().percent
+    gpu_alloc = cuda.memory_allocated() / (1024 ** 2)  # MB
+    gpu_cache = cuda.memory_reserved() / (1024 ** 2)  # MB
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    log_entry = (
+        f"[{timestamp}] Epoch: {epoch:03d} | "
+        f"Train Loss: {train_loss:.4f} | "
+        f"Val Loss: {val_loss:.4f} | "
+        f"BLEU: {bleu_score:.2f} | "
+        f"CPU Mem: {cpu_mem:.1f}% | "
+        f"GPU Alloc: {gpu_alloc:.1f}MB | "
+        f"GPU Cache: {gpu_cache:.1f}MB\n"
+    )
+
+    with open(log_file, 'a') as f:
+        f.write(log_entry)
+
+    print(log_entry.strip())
 
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
@@ -52,15 +83,15 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
 
 
 def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt,
-                   max_len, device, print_msg, global_state, writer, num_examples=2):
+                   max_len, device, print_msg, global_state, writer, num_examples=-1):
     model.eval()
     count = 0
+    total_loss = 0
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer_tgt.token_to_id('[PAD]'))
 
     source_texts = []
     expected = []
     predicted = []
-
-    # Size of the control window (just use a default value)
     console_width = 80
 
     with torch.no_grad():
@@ -68,8 +99,20 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt,
             count += 1
             encoder_input = batch['encoder_input'].to(device)
             encoder_mask = batch['encoder_mask'].to(device)
+            decoder_input = batch['decoder_input'].to(device)
+            decoder_mask = batch['decoder_mask'].to(device)
+            label = batch['label'].to(device)
 
             assert encoder_input.size(0) == 1, "Batch size must be 1 for validation."
+
+            # Calculate validation loss
+            encoder_output = model.encode(encoder_input, encoder_mask)
+            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+            proj_output = model.project(decoder_output)
+
+            loss = criterion(proj_output.view(-1, tokenizer_tgt.get_vocab_size()),
+                             label.view(-1))
+            total_loss += loss.item()
 
             model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
 
@@ -81,14 +124,22 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt,
             expected.append(target_text)
             predicted.append(model_out_text)
 
-            # Print to the console
-            print_msg('-' * console_width)
-            print_msg(f'SOURCE: {source_text}')
-            print_msg(f'TARGET: {target_text}')
-            print_msg(f'PREDICTED: {model_out_text}')
+            if count < num_examples or num_examples == -1:
+                print_msg('-' * console_width)
+                print_msg(f'SOURCE: {source_text}')
+                print_msg(f'TARGET: {target_text}')
+                print_msg(f'PREDICTED: {model_out_text}')
 
             if count == num_examples:
                 break
+
+    avg_loss = total_loss / count
+
+    # Calculate BLEU score
+    smoothie = SmoothingFunction().method4
+    bleu = corpus_bleu([[ref] for ref in expected], predicted, smoothing_function=smoothie) * 100
+
+    return avg_loss, bleu
 
 
 def get_all_sentences(ds, lang):
@@ -110,23 +161,27 @@ def get_or_build_tokenizer(config, ds, lang):
 
 
 def get_ds(config):
-    # ds_raw = load_dataset('opus_books', f'{config["lang_src"]}-{config["lang_tgt"]}', split='train')
-    # ds_raw.save_to_disk('./dataset/opus_books')
     ds_raw = load_from_disk('/root/autodl-tmp/datasets/opus_books')
 
     # Build tokenizers
     tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
     tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
 
-    # Keep 90% for training and 10% for validation
-    train_ds_size = int(0.9 * len(ds_raw))
-    val_ds_size = len(ds_raw) - train_ds_size
-    train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size])
+    # Keep 80% for training, 10% for validation and 10% for testing
+    train_ds_size = int(0.8 * len(ds_raw))
+    val_ds_size = int(0.1 * len(ds_raw))
+    test_ds_size = len(ds_raw) - train_ds_size - val_ds_size
+
+    # Split the dataset
+    train_ds_raw, remaining = random_split(ds_raw, [train_ds_size, len(ds_raw) - train_ds_size])
+    val_ds_raw, test_ds_raw = random_split(remaining, [val_ds_size, test_ds_size])
 
     train_ds = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt,
                                 config['lang_src'], config['lang_tgt'], config['seq_len'])
     val_ds = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt,
                               config['lang_src'], config['lang_tgt'], config['seq_len'])
+    test_ds = BilingualDataset(test_ds_raw, tokenizer_src, tokenizer_tgt,
+                               config['lang_src'], config['lang_tgt'], config['seq_len'])
 
     max_len_src = 0
     max_len_tgt = 0
@@ -141,9 +196,9 @@ def get_ds(config):
     print(f'Max length of target sentence: {max_len_tgt}')
 
     train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
-    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    val_dataloader = DataLoader(val_ds, batch_size=8, shuffle=False)  # 适当增大batch_size
 
-    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+    return train_dataloader, val_dataloader, test_ds, tokenizer_src, tokenizer_tgt
 
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
@@ -154,15 +209,16 @@ def get_model(config, vocab_src_len, vocab_tgt_len):
 
 
 def train_model(config):
-    # Define the device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
     Path(config['model_folder']).mkdir(parents=True, exist_ok=True)
 
-    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
+    train_dataloader, val_dataloader, test_ds, tokenizer_src, tokenizer_tgt = get_ds(config)
+    # Save test dataset for later use in test.py
+    torch.save(test_ds, 'test_dataset.pt')
+
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
-    # Tensorboard
     writer = SummaryWriter(config['experiment_name'])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
@@ -179,47 +235,58 @@ def train_model(config):
     else:
         print('No model to preload, starting from scratch')
 
-    # loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]')).to(device)
 
+    # Initialize logging
+    with open(config['log_file'], 'w') as f:
+        f.write("Starting training...\n")
+
     for epoch in range(initial_epoch, config['num_epochs']):
+        epoch_start_time = time.time()
+        train_losses = []
+
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
         for batch in batch_iterator:
             model.train()
 
-            encoder_input = batch['encoder_input'].to(device)   # (batch, seq_len)
-            decoder_input = batch['decoder_input'].to(device)   # (batch, seq_len)
-            encoder_mask = batch['encoder_mask'].to(device)     # (batch, 1, 1, seq_len)
-            decoder_mask = batch['decoder_mask'].to(device)     # (batch, 1, seq_len, seq_len)
+            encoder_input = batch['encoder_input'].to(device)
+            decoder_input = batch['decoder_input'].to(device)
+            encoder_mask = batch['encoder_mask'].to(device)
+            decoder_mask = batch['decoder_mask'].to(device)
 
-            # Run the tensors through the transformer
-            encoder_output = model.encode(encoder_input, encoder_mask)  # (batch, seq, d_model)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)    # (batch, seq, d_model)
-            proj_output = model.project(decoder_output)     # (batch, seq_len, tgt_vocab_size)
+            encoder_output = model.encode(encoder_input, encoder_mask)
+            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+            proj_output = model.project(decoder_output)
 
-            label = batch['label'].to(device)   # (batch, seq_len)
+            label = batch['label'].to(device)
 
-            # (batch, seq, tgt_vocab_size) --> (batch * seq, tgt_vocab_size)
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
             batch_iterator.set_postfix({"Loss": f"Loss: {loss.item():6.3f}"})
+            train_losses.append(loss.item())
 
-            # Log the loss
             writer.add_scalar("train loss", loss.item(), global_step=global_step)
             writer.flush()
 
-            # Backpropagate the loss
             loss.backward()
-
-            # Update the weights
             optimizer.step()
             optimizer.zero_grad()
-
             global_step += 1
 
-        run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device,
-                       lambda msg: batch_iterator.write(msg), global_step, writer)
+        # Calculate average training loss
+        avg_train_loss = sum(train_losses) / len(train_losses)
 
-        # Save the model at the end of every epoch
+        # Run validation and get BLEU score
+        val_loss, bleu_score = run_validation(
+            model, val_dataloader, tokenizer_src, tokenizer_tgt,
+            config['seq_len'], device,
+            lambda msg: batch_iterator.write(msg),
+            global_step, writer,
+            num_examples=2  # 仅展示2条，但计算全部
+        )
+
+        # Log metrics
+        log_metrics(epoch, avg_train_loss, val_loss, bleu_score, config['log_file'])
+
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
         torch.save({
             'epoch': epoch,
@@ -230,6 +297,5 @@ def train_model(config):
 
 
 if __name__ == '__main__':
-    warnings.filterwarnings("ignore")
     config = get_config()
     train_model(config)
